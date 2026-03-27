@@ -17,7 +17,7 @@ def client():
 def test_home_page_returns_html(client):
     resp = client.get("/")
     assert resp.status_code == 200
-    assert b"House Rent Predictor" in resp.data
+    assert b"House Price Predictor" in resp.data
     assert resp.content_type.startswith("text/html")
 
 
