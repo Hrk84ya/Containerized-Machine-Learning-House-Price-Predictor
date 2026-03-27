@@ -289,13 +289,32 @@ def home():
     """
     return render_template_string(html)
 
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    data = request.get_json()
-    features = np.array(data["features"]).reshape(1, -1)
-    features_scaled = scaler.transform(features)
-    prediction = model.predict(features_scaled).tolist()
-    return jsonify({"prediction": prediction})
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
+
+    features = data.get("features")
+    if not isinstance(features, list):
+        return jsonify({"error": "'features' must be a list"}), 400
+
+    if len(features) != 4:
+        return jsonify({"error": "'features' must contain exactly 4 values: [sqft, bedrooms, bathrooms, year_built]"}), 400
+
+    for i, val in enumerate(features):
+        if not isinstance(val, (int, float)):
+            return jsonify({"error": f"Feature at index {i} must be a number"}), 400
+
+    try:
+        features_arr = np.array(features).reshape(1, -1)
+        features_scaled = scaler.transform(features_arr)
+        prediction = model.predict(features_scaled).tolist()
+        return jsonify({"prediction": prediction})
+    except Exception as e:
+        return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5050)
