@@ -1,5 +1,8 @@
 import pickle
+import hashlib
+import datetime
 import numpy as np
+import sklearn
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -45,13 +48,42 @@ X_test_scaled = scaler.transform(X_test)
 model = RandomForestRegressor(n_estimators=100, random_state=42)
 model.fit(X_train_scaled, y_train)
 
-# Save both the model and scaler
-with open("model.pkl", "wb") as f:
-    pickle.dump({"model": model, "scaler": scaler}, f)
-
-# Print model performance
+# Evaluate model performance
 train_score = model.score(X_train_scaled, y_train)
 test_score = model.score(X_test_scaled, y_test)
+
+# Build versioned artifact with metadata
+model_data = pickle.dumps({"model": model, "scaler": scaler})
+model_hash = hashlib.sha256(model_data).hexdigest()[:12]
+
+artifact = {
+    "model": model,
+    "scaler": scaler,
+    "metadata": {
+        "version": "1.0.0",
+        "model_hash": model_hash,
+        "trained_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "algorithm": "RandomForestRegressor",
+        "n_estimators": 100,
+        "random_state": 42,
+        "sklearn_version": sklearn.__version__,
+        "numpy_version": np.__version__,
+        "features": ["sqft", "bedrooms", "bathrooms", "year_built"],
+        "n_samples": n_samples,
+        "test_size": 0.2,
+        "train_r2": round(train_score, 4),
+        "test_r2": round(test_score, 4),
+    },
+}
+
+with open("model.pkl", "wb") as f:
+    pickle.dump(artifact, f)
+
 print(f"Model training completed and saved as model.pkl")
-print(f"Training R² score: {train_score:.3f}")
-print(f"Testing R² score: {test_score:.3f}")
+print(f"  Version:      {artifact['metadata']['version']}")
+print(f"  Hash:         {model_hash}")
+print(f"  Trained at:   {artifact['metadata']['trained_at']}")
+print(f"  Train R²:     {train_score:.4f}")
+print(f"  Test R²:      {test_score:.4f}")
+print(f"  sklearn:      {sklearn.__version__}")
+print(f"  Features:     {artifact['metadata']['features']}")
