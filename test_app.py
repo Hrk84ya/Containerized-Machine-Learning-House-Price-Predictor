@@ -1,11 +1,24 @@
 import pytest
 import json
-from app import app, model_metadata
+import os
+from unittest.mock import patch
+from app import app, model_metadata, limiter
 
 
 @pytest.fixture
 def client():
     app.config["TESTING"] = True
+    limiter.enabled = False
+    with app.test_client() as client:
+        yield client
+    limiter.enabled = True
+
+
+@pytest.fixture
+def client_with_limits():
+    """Client with rate limiting enabled."""
+    app.config["TESTING"] = True
+    limiter.enabled = True
     with app.test_client() as client:
         yield client
 
@@ -279,3 +292,107 @@ def test_home_post_not_allowed(client):
     """POST on / should be 405."""
     resp = client.post("/")
     assert resp.status_code == 405
+
+
+# ---------------------------------------------------------------------------
+# API key authentication
+# ---------------------------------------------------------------------------
+
+@patch.dict(os.environ, {"API_KEY": "test-secret-key"})
+def test_predict_requires_api_key(client):
+    """When API_KEY is set, requests without a key get 401."""
+    resp = client.post(
+        "/predict",
+        data=json.dumps({"features": [2000, 3, 2, 2000]}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 401
+    assert "Missing API key" in resp.get_json()["error"]
+
+
+@patch.dict(os.environ, {"API_KEY": "test-secret-key"})
+def test_predict_rejects_wrong_api_key(client):
+    """Wrong API key returns 403."""
+    resp = client.post(
+        "/predict",
+        data=json.dumps({"features": [2000, 3, 2, 2000]}),
+        content_type="application/json",
+        headers={"X-API-Key": "wrong-key"},
+    )
+    assert resp.status_code == 403
+    assert "Invalid" in resp.get_json()["error"]
+
+
+@patch.dict(os.environ, {"API_KEY": "test-secret-key"})
+def test_predict_accepts_valid_api_key_header(client):
+    """Correct API key in X-API-Key header passes auth."""
+    resp = client.post(
+        "/predict",
+        data=json.dumps({"features": [2000, 3, 2, 2000]}),
+        content_type="application/json",
+        headers={"X-API-Key": "test-secret-key"},
+    )
+    assert resp.status_code == 200
+    assert "prediction" in resp.get_json()
+
+
+@patch.dict(os.environ, {"API_KEY": "test-secret-key"})
+def test_predict_accepts_api_key_query_param(client):
+    """Correct API key as query param passes auth."""
+    resp = client.post(
+        "/predict?api_key=test-secret-key",
+        data=json.dumps({"features": [2000, 3, 2, 2000]}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 200
+
+
+@patch.dict(os.environ, {"API_KEY": "test-secret-key"})
+def test_model_info_requires_api_key(client):
+    """model/info is also protected when API_KEY is set."""
+    resp = client.get("/model/info")
+    assert resp.status_code == 401
+
+
+@patch.dict(os.environ, {"API_KEY": "test-secret-key"})
+def test_health_and_home_bypass_auth(client):
+    """Public routes should not require auth even when API_KEY is set."""
+    assert client.get("/").status_code == 200
+    assert client.get("/health").status_code == 200
+
+
+def test_no_auth_when_api_key_unset(client):
+    """When API_KEY env var is not set, all endpoints are open."""
+    resp = client.post(
+        "/predict",
+        data=json.dumps({"features": [2000, 3, 2, 2000]}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+def test_predict_rate_limit(client_with_limits):
+    """Predict endpoint should enforce rate limits."""
+    for _ in range(10):
+        client_with_limits.post(
+            "/predict",
+            data=json.dumps({"features": [2000, 3, 2, 2000]}),
+            content_type="application/json",
+        )
+    resp = client_with_limits.post(
+        "/predict",
+        data=json.dumps({"features": [2000, 3, 2, 2000]}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 429
+
+
+def test_health_exempt_from_rate_limit(client_with_limits):
+    """Health endpoint should never be rate limited."""
+    for _ in range(250):
+        resp = client_with_limits.get("/health")
+    assert resp.status_code == 200

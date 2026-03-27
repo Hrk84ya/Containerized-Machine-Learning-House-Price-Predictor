@@ -2,8 +2,12 @@ from flask import Flask, request, jsonify, render_template, g
 import pickle
 import numpy as np
 import logging
+import os
 import time
 import uuid
+from functools import wraps
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 # Configure structured logging
 logging.basicConfig(
@@ -31,6 +35,42 @@ logger.info(
 
 app = Flask(__name__)
 
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",
+)
+
+# ---------------------------------------------------------------------------
+# API key authentication
+# ---------------------------------------------------------------------------
+
+
+def _get_api_key():
+    return os.environ.get("API_KEY")
+
+
+def require_api_key(f):
+    """Protect a route with API key auth. Skipped when no API_KEY is configured."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        api_key = _get_api_key()
+        if api_key is None:
+            return f(*args, **kwargs)
+        provided = request.headers.get("X-API-Key") or request.args.get("api_key")
+        if not provided:
+            logger.warning("auth | id=%s error=missing_api_key", g.request_id)
+            return jsonify({"error": "Missing API key. Provide X-API-Key header or api_key query param."}), 401
+        if provided != api_key:
+            logger.warning("auth | id=%s error=invalid_api_key", g.request_id)
+            return jsonify({"error": "Invalid API key."}), 403
+        return f(*args, **kwargs)
+    return decorated
+
 
 @app.before_request
 def before_request():
@@ -57,22 +97,28 @@ def after_request(response):
     return response
 
 @app.route("/health", methods=["GET"])
+@limiter.exempt
 def health_check():
     logger.info("health_check | status=healthy")
     return jsonify({"status": "healthy"})
 
 
 @app.route("/model/info", methods=["GET"])
+@require_api_key
+@limiter.limit("30 per minute")
 def model_info():
     logger.info("model_info | version=%s", model_metadata.get("version"))
     return jsonify(model_metadata)
 
 @app.route("/", methods=["GET"])
+@limiter.exempt
 def home():
     return render_template("index.html")
 
 
 @app.route("/predict", methods=["POST"])
+@require_api_key
+@limiter.limit("10 per minute")
 def predict():
     data = request.get_json(silent=True)
     if data is None:
