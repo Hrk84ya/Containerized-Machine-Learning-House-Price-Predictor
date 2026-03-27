@@ -17,21 +17,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load the model, scaler, and metadata
-logger.info("Loading model artifact from model.pkl")
-with open("model.pkl", "rb") as f:
-    saved_data = pickle.load(f)
-    model = saved_data["model"]
-    scaler = saved_data["scaler"]
-    model_metadata = saved_data.get("metadata", {"version": "unknown"})
-logger.info(
-    "Model loaded | version=%s hash=%s trained_at=%s train_r2=%s test_r2=%s",
-    model_metadata.get("version", "unknown"),
-    model_metadata.get("model_hash", "unknown"),
-    model_metadata.get("trained_at", "unknown"),
-    model_metadata.get("train_r2", "unknown"),
-    model_metadata.get("test_r2", "unknown"),
-)
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+MODEL_PATH = os.environ.get("MODEL_PATH", "model.pkl")
+
+model = None
+scaler = None
+model_metadata = {"version": "unknown"}
+model_load_error = None
+
+
+def load_model(path=None):
+    """Load model artifact from disk. Returns (model, scaler, metadata) or raises."""
+    path = path or MODEL_PATH
+    global model, scaler, model_metadata, model_load_error
+
+    logger.info("Loading model artifact from %s", path)
+    try:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Model file not found: {path}")
+
+        with open(path, "rb") as f:
+            saved_data = pickle.load(f)
+
+        if not isinstance(saved_data, dict):
+            raise ValueError(f"Expected dict in pickle, got {type(saved_data).__name__}")
+
+        if "model" not in saved_data or "scaler" not in saved_data:
+            missing = [k for k in ("model", "scaler") if k not in saved_data]
+            raise KeyError(f"Model artifact missing required keys: {missing}")
+
+        model = saved_data["model"]
+        scaler = saved_data["scaler"]
+        model_metadata = saved_data.get("metadata", {"version": "unknown"})
+        model_load_error = None
+
+        logger.info(
+            "Model loaded | version=%s hash=%s trained_at=%s train_r2=%s test_r2=%s",
+            model_metadata.get("version", "unknown"),
+            model_metadata.get("model_hash", "unknown"),
+            model_metadata.get("trained_at", "unknown"),
+            model_metadata.get("train_r2", "unknown"),
+            model_metadata.get("test_r2", "unknown"),
+        )
+    except Exception as e:
+        model = None
+        scaler = None
+        model_metadata = {"version": "unknown"}
+        model_load_error = str(e)
+        logger.error("Failed to load model: %s", e)
+
+
+# Attempt initial load — app still starts even if this fails
+load_model()
 
 app = Flask(__name__)
 
@@ -99,14 +138,21 @@ def after_request(response):
 @app.route("/health", methods=["GET"])
 @limiter.exempt
 def health_check():
-    logger.info("health_check | status=healthy")
-    return jsonify({"status": "healthy"})
+    status = "healthy" if model is not None else "degraded"
+    resp = {"status": status}
+    if model_load_error:
+        resp["model_error"] = model_load_error
+    logger.info("health_check | status=%s", status)
+    code = 200 if model is not None else 503
+    return jsonify(resp), code
 
 
 @app.route("/model/info", methods=["GET"])
 @require_api_key
 @limiter.limit("30 per minute")
 def model_info():
+    if model is None:
+        return jsonify({"error": "Model not loaded", "detail": model_load_error}), 503
     logger.info("model_info | version=%s", model_metadata.get("version"))
     return jsonify(model_metadata)
 
@@ -120,6 +166,9 @@ def home():
 @require_api_key
 @limiter.limit("10 per minute")
 def predict():
+    if model is None:
+        return jsonify({"error": "Model not loaded", "detail": model_load_error}), 503
+
     data = request.get_json(silent=True)
     if data is None:
         logger.warning("predict | id=%s error=invalid_json", g.request_id)

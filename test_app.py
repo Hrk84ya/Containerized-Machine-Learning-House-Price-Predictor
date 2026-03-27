@@ -2,6 +2,7 @@ import pytest
 import json
 import os
 from unittest.mock import patch
+import app as app_module
 from app import app, model_metadata, limiter
 
 
@@ -42,7 +43,7 @@ def test_health_check(client):
     resp = client.get("/health")
     assert resp.status_code == 200
     data = resp.get_json()
-    assert data == {"status": "healthy"}
+    assert data["status"] == "healthy"
 
 
 # ---------------------------------------------------------------------------
@@ -396,3 +397,115 @@ def test_health_exempt_from_rate_limit(client_with_limits):
     for _ in range(250):
         resp = client_with_limits.get("/health")
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Model loading failures
+# ---------------------------------------------------------------------------
+
+class TestModelLoadingFailures:
+    """Tests that verify graceful degradation when the model can't be loaded."""
+
+    def _break_model(self):
+        """Simulate a missing model by pointing to a nonexistent file."""
+        app_module.model = None
+        app_module.scaler = None
+        app_module.model_metadata = {"version": "unknown"}
+        app_module.model_load_error = "Model file not found: missing.pkl"
+
+    def _restore_model(self):
+        """Reload the real model."""
+        app_module.load_model()
+
+    def test_health_returns_degraded_when_model_missing(self, client):
+        self._break_model()
+        try:
+            resp = client.get("/health")
+            assert resp.status_code == 503
+            data = resp.get_json()
+            assert data["status"] == "degraded"
+            assert "model_error" in data
+        finally:
+            self._restore_model()
+
+    def test_predict_returns_503_when_model_missing(self, client):
+        self._break_model()
+        try:
+            resp = client.post(
+                "/predict",
+                data=json.dumps({"features": [2000, 3, 2, 2000]}),
+                content_type="application/json",
+            )
+            assert resp.status_code == 503
+            data = resp.get_json()
+            assert "Model not loaded" in data["error"]
+            assert data["detail"] is not None
+        finally:
+            self._restore_model()
+
+    def test_model_info_returns_503_when_model_missing(self, client):
+        self._break_model()
+        try:
+            resp = client.get("/model/info")
+            assert resp.status_code == 503
+            assert "Model not loaded" in resp.get_json()["error"]
+        finally:
+            self._restore_model()
+
+    def test_home_still_works_when_model_missing(self, client):
+        self._break_model()
+        try:
+            resp = client.get("/")
+            assert resp.status_code == 200
+        finally:
+            self._restore_model()
+
+    def test_load_model_with_missing_file(self):
+        app_module.load_model("/tmp/nonexistent_model_12345.pkl")
+        try:
+            assert app_module.model is None
+            assert "not found" in app_module.model_load_error
+        finally:
+            self._restore_model()
+
+    def test_load_model_with_corrupt_file(self, tmp_path):
+        bad_file = tmp_path / "corrupt.pkl"
+        bad_file.write_text("not a pickle")
+        app_module.load_model(str(bad_file))
+        try:
+            assert app_module.model is None
+            assert app_module.model_load_error is not None
+        finally:
+            self._restore_model()
+
+    def test_load_model_with_missing_keys(self, tmp_path):
+        import pickle
+        bad_file = tmp_path / "incomplete.pkl"
+        with open(bad_file, "wb") as f:
+            pickle.dump({"scaler": "fake"}, f)  # missing "model" key
+        app_module.load_model(str(bad_file))
+        try:
+            assert app_module.model is None
+            assert "missing required keys" in app_module.model_load_error.lower()
+        finally:
+            self._restore_model()
+
+    def test_load_model_with_wrong_type(self, tmp_path):
+        import pickle
+        bad_file = tmp_path / "wrong_type.pkl"
+        with open(bad_file, "wb") as f:
+            pickle.dump("just a string", f)
+        app_module.load_model(str(bad_file))
+        try:
+            assert app_module.model is None
+            assert "Expected dict" in app_module.model_load_error
+        finally:
+            self._restore_model()
+
+    def test_recovery_after_failure(self):
+        """After a failed load, a successful load_model() restores service."""
+        app_module.load_model("/tmp/nonexistent_12345.pkl")
+        assert app_module.model is None
+        app_module.load_model()  # reload real model
+        assert app_module.model is not None
+        assert app_module.model_load_error is None
